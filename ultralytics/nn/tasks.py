@@ -60,6 +60,7 @@ from ultralytics.nn.modules import (
     ImagePoolingAttn,
     Index,
     LRPCHead,
+    MultiDetect,
     Pose,
     Pose26,
     RepC3,
@@ -94,6 +95,7 @@ from ultralytics.utils.checks import REMOTE_FILE_PREFIXES, check_file, check_req
 from ultralytics.utils.loss import (
     DepthLoss26,
     E2ELoss,
+    MultiHeadDetectionLoss,
     PoseLoss26,
     SemanticSegmentationLoss,
     v8ClassificationLoss,
@@ -336,12 +338,15 @@ class BaseModel(torch.nn.Module):
         """
         model = (weights.get("ema") or weights["model"]) if isinstance(weights, dict) else weights  # ema first
         csd = model.float().state_dict()  # checkpoint state_dict as FP32
+        csd = self._adapt_pretrained_state_dict(csd)  # e.g. expand a shared neck into per-dataset branches
         # Detect cls branch width (c3) depends on nc, so rebuild it at the source width to transfer its hidden layers,
         # but only when the head input widths match, since a branch from another model scale cannot run on this neck
         head, src_head = self.model[-1], getattr(model, "model", [None])[-1]
         if (
             isinstance(head, Detect)
             and isinstance(src_head, Detect)
+            and head.cv2 is not None
+            and src_head.cv2 is not None
             and not (self.is_fused() or model.is_fused())
             and [m[0].conv.in_channels for m in head.cv2] == [m[0].conv.in_channels for m in src_head.cv2]
         ):
@@ -378,6 +383,17 @@ class BaseModel(torch.nn.Module):
             LOGGER.info(f"Transferred {len_updated_csd}/{len(self.model.state_dict())} items from pretrained weights")
             if getattr(model, "is_fused", lambda: False)() and not self.is_fused():
                 LOGGER.warning("Pretrained weights are fused for inference; train from the unfused checkpoint instead.")
+
+    def _adapt_pretrained_state_dict(self, csd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Adapt a pretrained state dict before intersection; identity by default.
+
+        Args:
+            csd (dict[str, torch.Tensor]): Pretrained checkpoint state dict.
+
+        Returns:
+            (dict[str, torch.Tensor]): State dict ready for `intersect_dicts`.
+        """
+        return csd
 
     def _remap_cls_by_names(self, csd: dict[str, torch.Tensor], src_model: torch.nn.Module, verbose: bool = True):
         """Remap pretrained classification head rows to current class order by name.
@@ -487,7 +503,9 @@ def _initialize_yolo_model(model, cfg, ch, nc, verbose):
         LOGGER.info(f"Overriding model.yaml nc={model.yaml['nc']} with nc={nc}")
         model.yaml["nc"] = nc  # override YAML value
     model.model, model.save = parse_model(deepcopy(model.yaml), ch=ch, verbose=verbose)  # model, savelist
-    model.names = {i: f"{i}" for i in range(model.yaml["nc"])}  # default names dict
+    model_nc = model.yaml["nc"]
+    # Multi-head models carry one nc per dataset head; flatten the placeholder names to the total class count
+    model.names = {i: f"{i}" for i in range(sum(model_nc) if isinstance(model_nc, (list, tuple)) else model_nc)}
     model.inplace = model.yaml.get("inplace", True)
 
 
@@ -650,6 +668,230 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2ELoss(self) if getattr(self.model[-1], "one2one_cv2", None) is not None else v8DetectionLoss(self)
+
+
+class DatasetBranch(nn.Module):
+    """Per-dataset replicas of one model layer, routed by the active dataset index.
+
+    Holds one deep-copied version of a layer per dataset so the backbone stays shared while each dataset owns an
+    independent neck. `active` selects which replica runs and is kept in sync with the `MultiDetect` head by
+    `MultiHeadDetectionModel`.
+
+    Attributes:
+        branches (nn.ModuleList): One independent copy of the layer per dataset.
+        active (int): Index of the dataset branch to run.
+
+    Examples:
+        >>> branch = DatasetBranch([nn.Conv2d(3, 3, 1), nn.Conv2d(3, 3, 1)])
+        >>> branch.active = 1
+    """
+
+    def __init__(self, modules: list[nn.Module]):
+        """Store one independent copy of a layer per dataset.
+
+        Args:
+            modules (list[nn.Module]): Layer copies in dataset order.
+        """
+        super().__init__()
+        self.branches = nn.ModuleList(modules)
+        self.active = 0
+
+    def forward(self, x):
+        """Run the active dataset's copy of the layer."""
+        return self.branches[self.active](x)
+
+
+class MultiHeadDetectionModel(DetectionModel):
+    """YOLO detection model with one detection head per dataset for multi-dataset joint training.
+
+    Each dataset owns a `Detect` head with its own class count. Training runs only the head of the batch's dataset
+    (`dataset_idx`), and inference runs every head, so the model exports as a single static graph with one output per
+    dataset. `share` selects how much of the network is shared across datasets:
+
+    - `"all"` (default): the backbone and the neck are shared, and only the detection heads are per-dataset.
+    - `"backbone"`: only the backbone is shared; every neck layer after the backbone is replicated per dataset into a
+      `DatasetBranch`, so each dataset has its own neck and head.
+
+    Attributes:
+        nc_list (list[int]): Number of classes of each dataset head, in dataset order.
+        share (str): Weight-sharing scope, `"all"` or `"backbone"`.
+        dataset_names (list[dict[int, str]]): Class names of each dataset head, filled by the multi-dataset trainer.
+
+    Examples:
+        >>> model = MultiHeadDetectionModel("yolo11n.yaml", nc=[3, 5])
+        >>> model = MultiHeadDetectionModel("yolo11n.yaml", nc=[3, 5], share="backbone")
+    """
+
+    def __init__(
+        self,
+        cfg="yolo11n.yaml",
+        ch: int = 3,
+        nc: list[int] | None = None,
+        share: str = "all",
+        verbose: bool = True,
+    ):
+        """Initialize the multi-head detection model from a YAML whose head row holds a list of per-dataset nc.
+
+        Args:
+            cfg (str | dict): Model configuration file path or dictionary.
+            ch (int): Number of input channels.
+            nc (list[int], optional): Number of classes of each dataset head, in dataset order.
+            share (str): Weight-sharing scope, `"all"` (backbone and neck shared) or `"backbone"` (neck per-dataset).
+            verbose (bool): Whether to display model information.
+
+        Raises:
+            ValueError: If `share` is not `"all"` or `"backbone"`.
+        """
+        if share not in {"all", "backbone"}:
+            raise ValueError(f"share must be 'all' or 'backbone', not {share!r}")
+        cfg = self._patch_cfg(cfg)
+        super().__init__(cfg, ch, nc, verbose)
+        m = self.model[-1]
+        if isinstance(m, MultiDetect):
+            for h in m.heads:  # sub-heads decode with their own stride/anchor tensors
+                h.stride = m.stride.clone()
+        self.nc_list = list(m.nc_list) if isinstance(m, MultiDetect) else [self.yaml["nc"]]
+        self.share = share
+        self._neck_split = len(self.yaml["backbone"])
+        self._neck_replicated = share == "backbone" and isinstance(m, MultiDetect) and len(self.nc_list) > 1
+        if self._neck_replicated:
+            self._replicate_neck()
+        self.dataset_names = []
+
+    def _replicate_neck(self):
+        """Replace every head-layer before `Detect` with one independent `DatasetBranch` per dataset."""
+        for j in range(self._neck_split, len(self.model) - 1):
+            layer = self.model[j]
+            wrapper = DatasetBranch([deepcopy(layer) for _ in range(len(self.nc_list))])
+            wrapper.i, wrapper.f, wrapper.type, wrapper.np = layer.i, layer.f, layer.type, layer.np
+            self.model[j] = wrapper
+
+    def _adapt_pretrained_state_dict(self, csd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Copy a pretrained neck into every dataset branch before weight intersection.
+
+        Args:
+            csd (dict[str, torch.Tensor]): Pretrained checkpoint state dict.
+
+        Returns:
+            (dict[str, torch.Tensor]): State dict with each shared neck tensor expanded into its per-dataset branches.
+        """
+        if not getattr(self, "_neck_replicated", False):
+            return csd
+        expanded = dict(csd)
+        for key, value in csd.items():
+            parts = key.split(".", 2)
+            if len(parts) != 3 or parts[0] != "model" or not parts[1].isdigit():
+                continue
+            j = int(parts[1])
+            if not self._neck_split <= j < len(self.model) - 1 or parts[2].startswith("branches."):
+                continue
+            for i in range(len(self.nc_list)):
+                expanded[f"model.{j}.branches.{i}.{parts[2]}"] = value
+        return expanded
+
+    def _predict_once(self, x, profile=False, embed=None):
+        """Route neck branches to the active dataset, or run every dataset branch at multi-output inference."""
+        m = self.model[-1]
+        if isinstance(m, MultiDetect):
+            if getattr(self, "_neck_replicated", False) and not self.training and m.active is None:
+                return self._predict_multi(x, profile, embed)
+            active = 0 if m.active is None else int(m.active)
+            for layer in self.model:
+                if isinstance(layer, DatasetBranch):
+                    layer.active = active
+        return super()._predict_once(x, profile, embed)
+
+    def _predict_multi(self, x, profile=False, embed=None):
+        """Run the shared backbone once, then every dataset's neck and head, returning one output per head.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            profile (bool): Unused; kept for signature parity with `_predict_once`.
+            embed (list, optional): Unused; kept for signature parity with `_predict_once`.
+
+        Returns:
+            (tuple | tuple, dict): Decoded output tensor per dataset head, or `(outputs, {"heads": raw_preds})`.
+        """
+        split = self._neck_split
+        y = []
+        for m in self.model[:split]:  # shared backbone, run once
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            x = m(x)
+            y.append(x if m.i in self.save else None)
+        neck = list(self.model[split:-1])
+        head = self.model[-1]
+        for h in head.heads:  # keep each sub-head's export settings in sync with the container
+            h.export, h.format = head.export, head.format
+            h.max_det, h.agnostic_nms, h.xyxy, h.dynamic = head.max_det, head.agnostic_nms, head.xyxy, head.dynamic
+            if head.dynamic:
+                h.shape = None
+        ys, raws = [], []
+        for i in range(len(self.nc_list)):
+            yi = list(y)  # shared outputs, extended by this dataset's neck outputs
+            xi = x
+            for m in neck:
+                m.active = i
+                if m.f != -1:
+                    xi = yi[m.f] if isinstance(m.f, int) else [xi if j == -1 else yi[j] for j in m.f]
+                xi = m(xi)
+                yi.append(xi if m.i in self.save else None)
+            f = head.f
+            head_in = yi[f] if isinstance(f, int) else [xi if j == -1 else yi[j] for j in f]
+            y_i, raw_i = head._head_inference(i, head_in)
+            ys.append(y_i)
+            raws.append(raw_i)
+        return tuple(ys) if head.export else (tuple(ys), {"heads": raws})
+
+    @staticmethod
+    def _patch_cfg(cfg: str | dict) -> dict:
+        """Swap the YAML detection head for `MultiDetect` so parse_model builds one head per dataset."""
+        cfg = yaml_model_load(cfg) if isinstance(cfg, (str, Path)) else deepcopy(cfg)
+        for row in cfg.get("head", []):
+            if len(row) > 2 and row[2] in {"Detect", "MultiDetect"}:
+                row[2] = "MultiDetect"
+                break
+        return cfg
+
+    def init_criterion(self):
+        """Initialize the per-head detection criterion, preserving end-to-end schedules when present."""
+        e2e = getattr(self.model[-1], "end2end", False)
+        return MultiHeadDetectionLoss(self, E2ELoss if e2e else v8DetectionLoss)
+
+    def loss(self, batch, preds=None):
+        """Activate the head of the batch's dataset, then compute the per-head loss.
+
+        Args:
+            batch (dict): Batch with a `dataset_idx` tag identifying its source dataset.
+            preds (torch.Tensor | list[torch.Tensor], optional): Predictions.
+
+        Returns:
+            loss (torch.Tensor): Loss tensor for backpropagation.
+            loss_items (dict[str, torch.Tensor]): Detached loss components.
+        """
+        m = self.model[-1]
+        if isinstance(m, MultiDetect):
+            ds = batch.get("dataset_idx")
+            if ds is not None and ds.numel():
+                m.active = int(ds.flatten()[0])  # training batches tag their dataset; validation keeps its set head
+        return super().loss(batch, preds)
+
+    def set_head_attr(self, **kwargs):
+        """Set attributes on every dataset head rather than on the head container.
+
+        Args:
+            **kwargs (Any): Attribute names and values.
+        """
+        m = self.model[-1]
+        if isinstance(m, MultiDetect):
+            for h in m.heads:
+                for k, v in kwargs.items():
+                    if not hasattr(h, k):
+                        LOGGER.warning(f"Head has no attribute '{k}'.")
+                        continue
+                    setattr(h, k, v)
+            return
+        super().set_head_attr(**kwargs)
 
 
 class OBBModel(DetectionModel):
@@ -2218,6 +2460,7 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset(
             {
                 Detect,
+                MultiDetect,
                 WorldDetect,
                 YOLOEDetect,
                 Segment,
@@ -2233,7 +2476,19 @@ def parse_model(d, ch, verbose=True):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+            if m in {
+                Detect,
+                MultiDetect,
+                YOLOEDetect,
+                Segment,
+                Segment26,
+                YOLOESegment,
+                YOLOESegment26,
+                Pose,
+                Pose26,
+                OBB,
+                OBB26,
+            }:
                 m.legacy = legacy
         elif m is Depth:
             args = [*args[:1], [ch[x] for x in f]]  # c_mid, ch tuple; drops the legacy mode arg old checkpoints store

@@ -84,6 +84,10 @@ keywords: Ultralytics, loss functions, Varifocal Loss, Focal Loss, Bbox Loss, Ro
 
 <br><br><hr><br>
 
+## ::: ultralytics.utils.loss.MultiHeadDetectionLoss
+
+<br><br><hr><br>
+
 ## ::: ultralytics.utils.loss.TVPDetectLoss
 
 <br><br><hr><br>

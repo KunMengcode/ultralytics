@@ -295,6 +295,147 @@ class Detect(nn.Module):
                 setattr(self, name[8:] if end2end else name, None)
 
 
+class MultiDetect(Detect):
+    """Detection head container holding one `Detect` head per dataset for multi-dataset joint training.
+
+    Training runs only the head selected by `active` (set from a batch's `dataset_idx`), while inference runs every
+    head and returns one decoded tensor per head - the static multi-output graph that edge toolchains consume.
+    Set `active` to an int during validation to score one dataset with its own head and local class indices.
+
+    Attributes:
+        nc_list (list[int]): Number of classes of each dataset head, in dataset order.
+        heads (nn.ModuleList): One `Detect` head per dataset.
+        active (int | None): Head index used in training/validation, or None to infer with all heads.
+    """
+
+    cv2 = None  # the container has no single-head branches; fused checks and remapping probe these attributes
+    one2one_cv2 = None
+
+    def __init__(
+        self,
+        nc: list[int] | tuple[int, ...] = (),
+        reg_max: int = 16,
+        end2end: bool = False,
+        ch: list[int] | tuple[int, ...] = (),
+    ):
+        """Build one Detect head per dataset entry in `nc`.
+
+        Args:
+            nc (list[int] | tuple[int, ...]): Number of classes of each dataset head, in dataset order.
+            reg_max (int): DFL channels.
+            end2end (bool): Whether each head uses one-to-one training branches.
+            ch (list[int] | tuple[int, ...]): Channel sizes from the neck feature maps.
+        """
+        nn.Module.__init__(self)
+        assert isinstance(nc, (list, tuple)) and len(nc) > 0, (
+            "MultiDetect requires a non-empty list of per-dataset 'nc' values"
+        )
+        self.nc_list = [int(n) for n in nc]
+        legacy = self.legacy  # class attribute set by parse_model before construction
+        default_legacy = Detect.legacy
+        Detect.legacy = legacy  # sub-heads read Detect.legacy while building their cv3 branches
+        try:
+            self.heads = nn.ModuleList(Detect(n, reg_max, end2end, ch) for n in self.nc_list)
+        finally:
+            Detect.legacy = default_legacy
+        self.nl = len(ch)
+        self.reg_max = reg_max
+        self.stride = torch.zeros(self.nl)
+        self.no = max(h.no for h in self.heads)
+        self.active = None  # set per batch while training; None runs every head at inference/export
+        self.shape = None
+
+    @property
+    def nc(self) -> int:
+        """Return the total number of classes across all heads (the flattened inference namespace)."""
+        return sum(self.nc_list)
+
+    def __setstate__(self, state):
+        """Reset per-run routing state when unpickling so a loaded checkpoint starts on all heads."""
+        super().__setstate__(state)
+        self.active = None
+
+    @property
+    def end2end(self) -> bool:
+        """Return True when the heads use one-to-one inference branches."""
+        return any(h.end2end for h in self.heads)
+
+    @end2end.setter
+    def end2end(self, value: bool) -> None:
+        """Select the inference branch on every head without changing dual-head training."""
+        for h in self.heads:
+            h.end2end = value
+
+    def _forward_head_train(self, index: int, x: list[torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Return the raw (loss-ready) predictions of one head, mirroring `Detect.forward` in training."""
+        head = self.heads[index]
+        preds = head.forward_head(x, **head.one2many)
+        if getattr(head, "one2one_cv2", None) is not None:
+            preds = {"one2many": preds, "one2one": head.forward_head([xi.detach() for xi in x], **head.one2one)}
+        return preds
+
+    def _head_inference(self, index: int, x: list[torch.Tensor]) -> tuple[torch.Tensor, dict]:
+        """Return (decoded predictions, raw predictions) of one head, mirroring `Detect.forward` at inference."""
+        head = self.heads[index]
+        preds = head.forward_head(x, **head.one2many)
+        if getattr(head, "one2one_cv2", None) is not None:
+            preds = {"one2many": preds, "one2one": head.forward_head(x, **head.one2one)}
+        raw = preds["one2one" if head.end2end else "one2many"] if "one2one" in preds else preds
+        y = head._inference(raw)
+        if head.end2end:
+            y = head.postprocess(y.permute(0, 2, 1))
+        return y, preds
+
+    def forward(
+        self, x: list[torch.Tensor]
+    ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor | tuple[torch.Tensor, ...], dict]:
+        """Run only the active head while training, and one or all heads at inference.
+
+        Args:
+            x (list[torch.Tensor]): Feature maps from each detection level.
+
+        Returns:
+            (dict | torch.Tensor | tuple): In training, the active head's raw prediction dict. At inference, the
+                decoded predictions of `active` (local class indices) or a tuple with one decoded tensor per head;
+                a (predictions, raw predictions) tuple unless `export` is set.
+        """
+        if self.training:
+            return self._forward_head_train(0 if self.active is None else self.active, x)
+        for h in self.heads:  # keep each head's export settings in sync with the container
+            h.export, h.format = self.export, self.format
+            h.max_det, h.agnostic_nms, h.xyxy, h.dynamic = self.max_det, self.agnostic_nms, self.xyxy, self.dynamic
+            if self.dynamic:
+                h.shape = None
+        if self.active is not None and not self.export:  # export always emits every head
+            y, preds = self._head_inference(self.active, x)
+            return y if self.export else (y, preds)
+        if not getattr(self, "_multi_output_warned", False):
+            LOGGER.warning(
+                "Multi-head inference returns one output tensor per dataset (no silent merge); use "
+                "MultiHeadDetectionPredictor, or set model.model.model[-1].active = <dataset index> to run one head."
+            )
+            self._multi_output_warned = True
+        outputs = [self._head_inference(i, x) for i in range(len(self.heads))]
+        ys = tuple(o[0] for o in outputs)
+        return ys if self.export else (ys, {"heads": [o[1] for o in outputs]})
+
+    def bias_init(self) -> None:
+        """Initialize each head's biases from the container strides."""
+        for h in self.heads:
+            h.stride = self.stride.clone()
+            h.bias_init()
+
+    def _apply(self, fn):
+        """Apply a transform to parameters and to the plain stride/anchor tensors held by every head."""
+        super()._apply(fn)
+        self.stride = fn(self.stride)
+        for h in self.heads:
+            h.stride = fn(h.stride)
+            h.anchors = fn(h.anchors)
+            h.strides = fn(h.strides)
+        return self
+
+
 class Segment(Detect):
     """YOLO Segment head for segmentation models.
 

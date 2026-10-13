@@ -1354,6 +1354,62 @@ class E2ELoss:
         return max(1 - x / max(self.one2one.hyp.epochs - 1, 1), 0) * (self.o2m_copy - self.final_o2m) + self.final_o2m
 
 
+class MultiHeadDetectionLoss:
+    """Criterion that routes each batch to the detection head of the dataset it came from.
+
+    One `v8DetectionLoss`-style criterion is built per head (each with its own nc, stride and assigner), and the
+    batch's `dataset_idx` tag selects which one computes the loss. This keeps per-head training math identical to
+    single-dataset training while every head shares the backbone.
+    """
+
+    def __init__(self, model: torch.nn.Module, loss_fn: type = v8DetectionLoss):
+        """Build one criterion per head by temporarily exposing each head as the model's last layer.
+
+        Args:
+            model (torch.nn.Module): Multi-head detection model whose `model[-1]` is a `MultiDetect`.
+            loss_fn (type): Criterion class to instantiate per head, `v8DetectionLoss` or `E2ELoss`.
+        """
+        self.model = model  # for the active-head fallback when a batch carries no dataset tag (validation)
+        saved_head = model.model[-1]
+        self.criteria = []
+        try:
+            for head in saved_head.heads:
+                model.model[-1] = head
+                self.criteria.append(loss_fn(model))
+        finally:
+            model.model[-1] = saved_head
+        self.loss_names = getattr(self.criteria[0], "loss_names", None)
+        self.hyp = getattr(self.criteria[0], "hyp", None)
+        # Optional per-head class weights computed by the multi-dataset trainer when cls_pw > 0.
+        weights = getattr(model, "per_head_class_weights", None)
+        if weights is not None:
+            device = self.criteria[0].device
+            for criterion, w in zip(self.criteria, weights):
+                criterion.class_weights = w.to(device).view(1, 1, -1)
+
+    def _index(self, batch: dict[str, torch.Tensor]) -> int:
+        """Return the dataset index of a homogeneous batch, defaulting to the model's active head."""
+        ds = batch.get("dataset_idx")
+        if ds is not None and ds.numel():
+            return int(ds.flatten()[0])
+        return int(getattr(self.model.model[-1], "active", 0) or 0)
+
+    def __call__(
+        self,
+        preds: dict[str, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]],
+        batch: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Calculate the loss with the criterion of the batch's dataset head."""
+        criterion = self.criteria[self._index(batch)]
+        return criterion(criterion.parse_output(preds), batch)
+
+    def update(self) -> None:
+        """Advance the end-to-end decay schedule of every head criterion that has one."""
+        for criterion in self.criteria:
+            if hasattr(criterion, "update"):
+                criterion.update()
+
+
 class TVPDetectLoss:
     """Criterion class for computing training losses for text-visual prompt detection."""
 

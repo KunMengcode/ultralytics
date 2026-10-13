@@ -118,6 +118,42 @@ path = model.export(format="onnx")  # Returns the path to the exported model
 
 Discover more examples in the YOLO [Python Docs](https://docs.ultralytics.com/usage/python).
 
+### Multi-Dataset Training
+
+> **Experimental:** Multi-dataset joint training is experimental and requires the custom `MultiDatasetDetectionTrainer`.
+
+Train one detection model jointly on several datasets, each with its own detection head and class set. The backbone
+and neck are shared by default; pass `share="backbone"` to share only the backbone and give every dataset its own neck.
+List the dataset YAMLs in a multi-dataset YAML:
+
+```yaml
+# multi.yaml
+train:
+  - african-wildlife.yaml
+  - HomeObjects-3K.yaml
+val: # optional; defaults to the train list (each dataset's own val split)
+  - african-wildlife.yaml
+  - HomeObjects-3K.yaml
+```
+
+```python
+from ultralytics import YOLO
+from ultralytics.models.yolo.detect import MultiDatasetDetectionTrainer
+
+model = YOLO("yolo11n.pt")
+model.train(
+    data="multi.yaml",
+    trainer=MultiDatasetDetectionTrainer,
+    share="backbone",  # "all" (default) shares backbone+neck; "backbone" keeps the neck per-dataset
+    epochs=100,
+    imgsz=640,
+)
+```
+
+Per-dataset losses and validation metrics are logged separately, the mean fitness across datasets selects the best
+checkpoint, and `model.export(format="onnx")` produces one output tensor per dataset head. See the
+[Multi-Dataset Training guide](https://docs.ultralytics.com/guides/multi-dataset-training) for details.
+
 </details>
 
 ## ✨ Models

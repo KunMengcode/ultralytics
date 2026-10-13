@@ -95,6 +95,7 @@ from ultralytics.nn.modules import (
     Classify,
     Depth,
     Detect,
+    MultiDetect,
     Pose,
     Pose26,
     RTDETRDecoder,
@@ -102,7 +103,13 @@ from ultralytics.nn.modules import (
     Segment26,
     SemanticSegment,
 )
-from ultralytics.nn.tasks import ClassificationModel, DepthModel, DetectionModel, SegmentationModel, WorldModel
+from ultralytics.nn.tasks import (
+    ClassificationModel,
+    DepthModel,
+    DetectionModel,
+    SegmentationModel,
+    WorldModel,
+)
 from ultralytics.utils import (
     ARM64,
     DEFAULT_CFG,
@@ -1138,12 +1145,18 @@ class Exporter:
 
         f = str(self.file.with_suffix(".onnx"))
         output_names = ["output0", "output1"] if self.model.task == "segment" else ["output0"]
+        head = self.model.model[-1] if isinstance(self.model, DetectionModel) else None
+        if isinstance(head, MultiDetect):
+            output_names = [f"output{i}" for i in range(len(head.heads))]  # one decoded tensor per dataset head
         dynamic = self.args.dynamic
         if dynamic:
             dynamic = {"images": {0: "batch", 2: "height", 3: "width"}}  # shape(1,3,640,640)
             if isinstance(self.model, SegmentationModel):
                 dynamic["output0"] = {0: "batch", 2: "anchors"}  # shape(1, 116, 8400)
                 dynamic["output1"] = {0: "batch", 2: "mask_height", 3: "mask_width"}  # shape(1,32,160,160)
+            elif isinstance(head, MultiDetect):
+                for name in output_names:  # shape(1, 4+nc_i, anchors)
+                    dynamic[name] = {0: "batch", 2: "anchors"}
             elif isinstance(self.model, DepthModel):
                 dynamic["output0"] = {0: "batch", 2: "height", 3: "width"}  # shape(1,1,640,640) dense map, not anchors
             elif isinstance(self.model, DetectionModel):

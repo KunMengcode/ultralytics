@@ -229,6 +229,77 @@ class ContiguousDistributedSampler(torch.utils.data.Sampler):
         self.epoch = epoch
 
 
+class MultiDatasetBatchSampler(torch.utils.data.Sampler):
+    """Yield dataset-homogeneous batches for multi-dataset training, one dataset per batch.
+
+    Batches are allocated per dataset in proportion to dataset size (every sample of every dataset is visited once
+    per epoch), then the global batch order is shuffled so datasets interleave. Distributed runs generate the same
+    plan on every rank and split it round-robin, keeping batches disjoint and per-rank step counts equal.
+
+    Args:
+        dataset_sizes (list[int]): Number of samples in each sub-dataset, in concatenation order.
+        batch_size (int): Maximum samples per batch (the last batch of a dataset may be smaller).
+        num_replicas (int, optional): Number of distributed processes. Defaults to 1.
+        rank (int, optional): Rank of the current process. Defaults to 0.
+        seed (int, optional): Base random seed for the per-epoch shuffling. Defaults to 0.
+
+    Examples:
+        >>> sampler = MultiDatasetBatchSampler([1000, 200], batch_size=16)
+        >>> loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=dataset.collate_fn)
+    """
+
+    def __init__(self, dataset_sizes: list[int], batch_size: int, num_replicas: int = 1, rank: int = 0, seed: int = 0):
+        """Initialize batch counts and dataset index boundaries."""
+        self.dataset_sizes = [int(s) for s in dataset_sizes]
+        self.batch_size = int(batch_size)
+        self.num_replicas = max(int(num_replicas), 1)
+        self.rank = int(rank)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.offsets = [0]
+        for size in self.dataset_sizes:
+            self.offsets.append(self.offsets[-1] + size)
+        total = sum(math.ceil(size / self.batch_size) for size in self.dataset_sizes if size > 0)
+        self.total_batches = total
+        usable = total - (total % self.num_replicas if self.num_replicas > 1 else 0)
+        self.num_batches = usable // self.num_replicas
+        if self.num_batches == 0:
+            raise ValueError(
+                f"MultiDatasetBatchSampler needs at least {self.num_replicas} batch(es), but the datasets hold "
+                f"{total} batch(es) at batch_size={self.batch_size}."
+            )
+
+    def _build_plan(self) -> list[list[int]]:
+        """Return this rank's shuffled list of per-batch global sample indices."""
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        plan = []
+        for i, size in enumerate(self.dataset_sizes):
+            if size <= 0:
+                continue
+            order = torch.randperm(size, generator=g).tolist()
+            for start in range(0, size, self.batch_size):
+                plan.append([self.offsets[i] + j for j in order[start : start + self.batch_size]])
+        plan = [plan[p] for p in torch.randperm(len(plan), generator=g).tolist()]
+        if self.num_replicas > 1:
+            plan = plan[: len(plan) - len(plan) % self.num_replicas][self.rank :: self.num_replicas]
+        return plan
+
+    def __iter__(self) -> Iterator[list[int]]:
+        """Yield one epoch of dataset-homogeneous batches, reshuffled each cycle."""
+        plan = self._build_plan()
+        self.epoch += 1
+        return iter(plan)
+
+    def __len__(self) -> int:
+        """Return the number of batches this rank yields per epoch."""
+        return self.num_batches
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch used to seed the next plan, for DDP parity with `DistributedSampler`."""
+        self.epoch = int(epoch)
+
+
 def seed_worker(worker_id: int) -> None:
     """Set dataloader worker seed for reproducibility across worker processes."""
     worker_seed = torch.initial_seed() % 2**32
@@ -355,6 +426,7 @@ def build_dataloader(
     drop_last: bool = False,
     pin_memory: bool = True,
     device: torch.device | str = "cuda",
+    batch_sampler: torch.utils.data.Sampler | None = None,
 ) -> InfiniteDataLoader:
     """Create and return an InfiniteDataLoader for training or validation.
 
@@ -368,6 +440,9 @@ def build_dataloader(
             one batch is kept.
         pin_memory (bool, optional): Whether to use pinned memory for dataloader.
         device (torch.device | str, optional): Device used by the dataloader consumer.
+        batch_sampler (torch.utils.data.Sampler, optional): Custom batch sampler that owns index generation (e.g.
+            `MultiDatasetBatchSampler`). When given, `batch`, `shuffle`, `drop_last` and `rank`-based samplers are
+            ignored for index generation.
 
     Returns:
         (InfiniteDataLoader): A dataloader that can be used for training or validation.
@@ -380,16 +455,19 @@ def build_dataloader(
     dataset_len = len(dataset)
     batch = min(batch, dataset_len)
     seed = torch.initial_seed() - RANK - 1
-    sampler = (
-        None
-        if rank == -1
-        else distributed.DistributedSampler(dataset, shuffle=shuffle, seed=seed)
-        if shuffle
-        else ContiguousDistributedSampler(dataset)
-    )
-    samples = len(sampler) if sampler is not None else dataset_len
-    drop_last = drop_last and samples > batch > 0 and samples % batch != 0
-    batches = (samples // batch if drop_last else math.ceil(samples / batch)) if batch else 0
+    if batch_sampler is not None:
+        sampler, batches, drop_last = None, len(batch_sampler), False
+    else:
+        sampler = (
+            None
+            if rank == -1
+            else distributed.DistributedSampler(dataset, shuffle=shuffle, seed=seed)
+            if shuffle
+            else ContiguousDistributedSampler(dataset)
+        )
+        samples = len(sampler) if sampler is not None else dataset_len
+        drop_last = drop_last and samples > batch > 0 and samples % batch != 0
+        batches = (samples // batch if drop_last else math.ceil(samples / batch)) if batch else 0
     device_type = getattr(device, "type", str(device).split(":")[0])
     nd = get_torch_device_backend(device).device_count() if device_type not in {"cpu", "mps"} else 0
     # Do not create more worker processes than final loader batches. Single-batch loaders run in-process to avoid
@@ -401,6 +479,18 @@ def build_dataloader(
     pin_memory_device = (
         device_type if pin_memory and device_type in {"npu", "xpu"} and TORCH_1_13 and not TORCH_2_7 else None
     )
+    if batch_sampler is not None:  # DataLoader forbids batch_size/shuffle/sampler/drop_last with batch_sampler
+        return InfiniteDataLoader(
+            dataset=dataset,
+            batch_sampler=batch_sampler,
+            num_workers=nw,
+            prefetch_factor=4 if nw > 0 else None,
+            pin_memory=pin_memory,
+            collate_fn=getattr(dataset, "collate_fn", None),
+            worker_init_fn=seed_worker,
+            generator=generator,
+            **({"pin_memory_device": pin_memory_device} if pin_memory_device else {}),
+        )
     return InfiniteDataLoader(
         dataset=dataset,
         batch_size=batch,

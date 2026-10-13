@@ -500,6 +500,7 @@ nav:
           - Knowledge Distillation 🚀: guides/knowledge-distillation.md
           - K-Fold Cross Validation: guides/kfold-cross-validation.md
           - Customizing Trainer: guides/custom-trainer.md
+          - Multi-Dataset Training: guides/multi-dataset-training.md
           - Model YAML Configuration Guide: guides/model-yaml-config.md
       - Evaluate & troubleshoot:
           - YOLO Performance Metrics: guides/yolo-performance-metrics.md

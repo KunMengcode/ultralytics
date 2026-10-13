@@ -20,6 +20,14 @@ keywords: Ultralytics, ultralytics.nn.tasks, API reference, YOLO, Python
 
 <br><br><hr><br>
 
+## ::: ultralytics.nn.tasks.DatasetBranch
+
+<br><br><hr><br>
+
+## ::: ultralytics.nn.tasks.MultiHeadDetectionModel
+
+<br><br><hr><br>
+
 ## ::: ultralytics.nn.tasks.OBBModel
 
 <br><br><hr><br>

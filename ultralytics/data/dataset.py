@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import ConcatDataset
+from torch.utils.data import ConcatDataset, Dataset
 
 from ultralytics.utils import LOCAL_RANK, LOGGER, NUM_THREADS, TQDM, IterableSimpleNamespace, colorstr
 from ultralytics.utils.instance import Instances
@@ -884,6 +884,45 @@ class YOLOConcatDataset(ConcatDataset):
             if not hasattr(dataset, "close_mosaic"):
                 continue
             dataset.close_mosaic(hyp)
+
+
+class MultiDatasetConcatDataset(YOLOConcatDataset):
+    """Dataset that concatenates multiple YOLO datasets and tags each sample with its source dataset index.
+
+    This supports multi-dataset joint training with one detection head per dataset: batches must be drawn from a
+    single dataset (see `MultiDatasetBatchSampler`) and the `dataset_idx` tag tells the model which head to run.
+
+    Attributes:
+        dataset_sizes (list[int]): Number of samples in each sub-dataset, in concatenation order.
+        dataset_offsets (np.ndarray): Cumulative start index of each sub-dataset.
+
+    Examples:
+        >>> dataset = MultiDatasetConcatDataset([ds1, ds2])
+        >>> label = dataset[0]  # carries "dataset_idx"
+    """
+
+    def __init__(self, datasets: list[Dataset]):
+        """Initialize the concatenated dataset and its per-dataset index boundaries.
+
+        Args:
+            datasets (list[Dataset]): Sub-datasets in concatenation order.
+        """
+        super().__init__(datasets)
+        self.dataset_sizes = [len(d) for d in datasets]
+        self.dataset_offsets = np.cumsum([0, *self.dataset_sizes])
+
+    def __getitem__(self, index: int) -> dict:
+        """Return the sample at `index` tagged with the index of its source dataset."""
+        label = super().__getitem__(index)
+        label["dataset_idx"] = int(np.searchsorted(self.dataset_offsets, index, side="right") - 1)
+        return label
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        """Collate samples and stack their dataset indices into a tensor."""
+        new_batch = YOLODataset.collate_fn(batch)
+        new_batch["dataset_idx"] = torch.as_tensor(new_batch["dataset_idx"], dtype=torch.long)
+        return new_batch
 
 
 class SemanticDataset(YOLODataset):

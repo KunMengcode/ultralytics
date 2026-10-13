@@ -32,6 +32,10 @@ keywords: Ultralytics, YOLODataset, object detection, segmentation, dataset load
 
 <br><br><hr><br>
 
+## ::: ultralytics.data.dataset.MultiDatasetConcatDataset
+
+<br><br><hr><br>
+
 ## ::: ultralytics.data.dataset.SemanticDataset
 
 <br><br><hr><br>

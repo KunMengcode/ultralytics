@@ -1,5 +1,10 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
+from __future__ import annotations
+
+import numpy as np
+import torch
+
 from ultralytics.engine.predictor import BasePredictor
 from ultralytics.engine.results import Results
 from ultralytics.utils import nms, ops
@@ -130,3 +135,64 @@ class DetectionPredictor(BasePredictor):
         """
         pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
         return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6])
+
+
+class MultiHeadDetectionPredictor(DetectionPredictor):
+    """Detection predictor that postprocesses one dataset head per NMS pass and merges the results.
+
+    Multi-head checkpoints return one decoded tensor per dataset head. This predictor runs NMS on each head, offsets
+    the class indices into the model's flattened namespace, and merges each image's detections by confidence so
+    Results objects behave like single-head detection.
+
+    Examples:
+        >>> from ultralytics import YOLO
+        >>> from ultralytics.models.yolo.detect import MultiHeadDetectionPredictor
+        >>> results = YOLO("multi-head-best.pt").predict("image.jpg", predictor=MultiHeadDetectionPredictor)
+    """
+
+    def postprocess(self, preds, img, orig_imgs, **kwargs):
+        """Run NMS per dataset head and merge detections into a single per-image result set.
+
+        Args:
+            preds (torch.Tensor | tuple[torch.Tensor, ...]): Model output; per-head tensors for multi-head inference,
+                otherwise regular detections.
+            img (torch.Tensor): Preprocessed input images.
+            orig_imgs (np.ndarray | list[np.ndarray]): Original images before preprocessing.
+            **kwargs (Any): Optional `iou` override forwarded by callers.
+
+        Returns:
+            (list[Results]): List of Results objects for the batch.
+        """
+        if not (
+            isinstance(preds, (tuple, list)) and len(preds) == 2 and isinstance(preds[1], dict) and "heads" in preds[1]
+        ):
+            return super().postprocess(preds, img, orig_imgs, **kwargs)
+        head_preds = preds[0]
+        if torch.is_tensor(head_preds):  # a single dataset head was run
+            return super().postprocess(head_preds, img, orig_imgs, **kwargs)
+        offsets = np.cumsum([0, *self._head_ncs()])[:-1]
+        iou = kwargs.pop("iou", self.args.iou)
+        merged = None
+        for offset, y in zip(offsets, head_preds):
+            dets = nms.non_max_suppression(
+                y, self.args.conf, iou, None, self.args.agnostic_nms, max_det=self.args.max_det
+            )
+            for det in dets:
+                if det.shape[0]:
+                    det[:, 5] += offset  # local head classes -> flattened model namespace
+            merged = dets if merged is None else [torch.cat((a, b), 0) for a, b in zip(merged, dets)]
+        for i, det in enumerate(merged):
+            if self.args.classes is not None and det.shape[0]:
+                det = det[np.isin(det[:, 5].cpu().numpy(), self.args.classes)]
+            if det.shape[0] > self.args.max_det:
+                det = det[det[:, 4].argsort(descending=True)[: self.args.max_det]]
+            merged[i] = det
+        return self.construct_results(merged, img, orig_imgs)
+
+    def _head_ncs(self) -> list[int]:
+        """Return the per-head class counts of the underlying checkpoint, or a single flattened count."""
+        native = getattr(self.model, "model", None)
+        seq = getattr(native, "model", None)
+        head = seq[-1] if isinstance(seq, torch.nn.Sequential) else None
+        ncs = getattr(head, "nc_list", None) if head is not None else None
+        return list(ncs) if ncs else [len(self.model.names)]

@@ -11,13 +11,14 @@ import torch
 import torch.distributed as dist
 
 from ultralytics.data import build_dataloader, build_yolo_dataset, converter
-from ultralytics.data.utils import get_split_fraction
+from ultralytics.data.utils import check_det_dataset, get_split_fraction
 from ultralytics.engine.validator import BaseValidator
+from ultralytics.nn.modules import MultiDetect
 from ultralytics.utils import DEFAULT_CFG, LOCAL_RANK, LOGGER, RANK, nms, ops
 from ultralytics.utils.checks import check_requirements
 from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from ultralytics.utils.plotting import plot_images
-from ultralytics.utils.torch_utils import torch_distributed_zero_first
+from ultralytics.utils.torch_utils import torch_distributed_zero_first, unwrap_model
 
 
 class DetectionValidator(BaseValidator):
@@ -628,3 +629,67 @@ class DetectionValidator(BaseValidator):
             except Exception as e:
                 LOGGER.warning(f"faster-coco-eval unable to run: {e}")
         return stats
+
+
+class MultiDatasetDetectionValidator(DetectionValidator):
+    """Detection validator that scores one dataset at a time with its matching dataset head.
+
+    The multi-dataset trainer sets `head_index` and `dataset_names` before each call; `get_model` then routes
+    inference through that head and installs the dataset's own class names, so metrics, plots and confusion
+    matrices stay local to the dataset being evaluated.
+
+    Attributes:
+        head_index (int | None): Index of the dataset head to run, or None to leave the model routing untouched.
+        dataset_names (dict[int, str] | None): Class names of the dataset being validated.
+
+    Examples:
+        >>> validator = MultiDatasetDetectionValidator(args=dict(data="multi.yaml"))
+    """
+
+    head_index = None
+
+    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks: dict | None = None):
+        """Initialize the validator with per-call routing state."""
+        super().__init__(dataloader, save_dir, args, _callbacks)
+        self.dataset_names = None
+
+    def get_model(self, model, trainer=None):
+        """Return the model to validate with, selecting the dataset head and installing its class names.
+
+        In standalone validation (`trainer` is None) the class names are read from `args.data` and head 0 is used
+        unless `head_index` is set, so `model.val(data=one_dataset.yaml, validator=MultiDatasetDetectionValidator)`
+        scores that dataset with its own head.
+
+        Args:
+            model (torch.nn.Module | str | Path | None): Model or checkpoint for standalone validation.
+            trainer (object, optional): Trainer whose model/EMA is used during training validation.
+
+        Returns:
+            (torch.nn.Module): Model prepared for the current dataset.
+        """
+        if trainer is not None and getattr(trainer, "ema", None) is None:
+            m = trainer.model  # final_eval validates the best.pt weights swapped into the trainer
+        else:
+            m = super().get_model(model, trainer)
+        if isinstance(m, torch.nn.Module):
+            native = unwrap_model(m)
+            head = getattr(native, "model", None)
+            head = head[-1] if isinstance(head, torch.nn.Sequential) else None
+            names = self.dataset_names
+            if isinstance(head, MultiDetect):
+                if trainer is None and names is None:  # standalone: local names from the validation YAML
+                    names = self._names_from_args()
+                    if self.head_index is None:
+                        head.active = 0
+                if self.head_index is not None:
+                    head.active = self.head_index
+            if names:
+                native.names = names
+        return m
+
+    def _names_from_args(self):
+        """Return the best-effort class names of a single-dataset validation YAML for standalone validation."""
+        try:
+            return check_det_dataset(str(self.args.data), split=self.args.split).get("names")
+        except Exception:  # multi-dataset YAMLs and missing files leave the checkpoint names in place
+            return None

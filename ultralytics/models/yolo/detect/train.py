@@ -2,23 +2,29 @@
 
 from __future__ import annotations
 
+import json
 import math
 import random
 from copy import copy
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 from torch import nn
 
-from ultralytics.data import build_dataloader, build_yolo_dataset
+from ultralytics.data import MultiDatasetBatchSampler, MultiDatasetConcatDataset, build_dataloader, build_yolo_dataset
+from ultralytics.data.utils import check_det_dataset
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
-from ultralytics.nn.tasks import DetectionModel
-from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
+from ultralytics.nn.tasks import DetectionModel, MultiHeadDetectionModel, load_checkpoint
+from ultralytics.utils import DEFAULT_CFG, LOCAL_RANK, LOGGER, RANK, YAML, colorstr
+from ultralytics.utils.checks import check_file
 from ultralytics.utils.patches import override_configs
 from ultralytics.utils.plotting import plot_images, plot_labels
-from ultralytics.utils.torch_utils import torch_distributed_zero_first, unwrap_model
+from ultralytics.utils.torch_utils import strip_optimizer, torch_distributed_zero_first, unwrap_model
+
+from .val import MultiDatasetDetectionValidator
 
 
 class DetectionTrainer(BaseTrainer):
@@ -254,3 +260,422 @@ class DetectionTrainer(BaseTrainer):
         n = len(train_dataset)
         del train_dataset  # free memory
         return super().auto_batch(max_num_obj, dataset_size=n)
+
+
+def _unique_labels(stems: list[str]) -> list[str]:
+    """Return display names for the datasets, disambiguating repeated YAML stems with an index suffix."""
+    labels, seen = [], {}
+    for stem in stems:
+        seen[stem] = seen.get(stem, 0) + 1
+        labels.append(stem if seen[stem] == 1 else f"{stem}-{seen[stem]}")
+    return labels
+
+
+def _display_names(entries: list) -> list[str]:
+    """Return a display name per dataset YAML, preferring the parent directory for generic file names."""
+    names = []
+    for entry in entries:
+        path = Path(str(entry))
+        stem = path.stem
+        names.append(path.parent.name if stem.lower() in {"data", "dataset"} and path.parent.name else stem)
+    return _unique_labels(names)
+
+
+def _flat_names(labels: list[str], names_list: list[dict[int, str]]) -> dict[int, str]:
+    """Flatten per-dataset class names into one namespace, prefixing names that repeat across datasets."""
+    flat, used = {}, set()
+    offset = 0
+    for label, names in zip(labels, names_list):
+        for j in sorted(names):
+            name = names[j]
+            key = f"{label}/{name}" if name in used else name
+            used.add(name)
+            flat[offset + j] = key
+        offset += len(names)
+    return flat
+
+
+class MultiDatasetDetectionTrainer(DetectionTrainer):
+    """Detection trainer for joint training on multiple datasets with one detection head per dataset.
+
+    The `data` argument points to a multi-dataset YAML listing one standard dataset YAML per entry:
+
+    ```yaml
+    train:
+      - /data/ds1/data.yaml
+      - /data/ds2/data.yaml
+    val: # optional; defaults to the train list (each dataset's own validation split)
+      - /data/ds1/data.yaml
+      - /data/ds2/data.yaml
+    ```
+
+    The backbone and neck are shared while each dataset owns a `Detect` head, and `MultiDatasetBatchSampler` draws
+    each batch from a single dataset in proportion to its size. Per-dataset training losses and validation metrics
+    are logged separately; the mean fitness across datasets selects the best checkpoint.
+
+    Attributes:
+        dataset_cfgs (list[dict]): Checked dataset dictionaries, one per training dataset (head order).
+        val_cfgs (list[dict]): Checked dataset dictionaries, one per validation dataset (paired with heads by index).
+        dataset_labels (list[str]): Display names of the datasets.
+        val_loaders (list[DataLoader]): One validation loader per dataset.
+        per_dataset_metrics (dict): Epoch -> {dataset name: metrics} for every validation pass.
+
+    Examples:
+        >>> from ultralytics import YOLO
+        >>> from ultralytics.models.yolo.detect import MultiDatasetDetectionTrainer
+        >>> model = YOLO("ultralytics/cfg/models/11/yolo11n.yaml")
+        >>> model.train(data="multi.yaml", trainer=MultiDatasetDetectionTrainer, epochs=100)
+    """
+
+    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks: dict | None = None):
+        """Initialize the multi-dataset trainer and register per-dataset logging callbacks.
+
+        Args:
+            cfg (dict, optional): Default configuration dictionary.
+            overrides (dict, optional): Configuration overrides.
+            _callbacks (dict, optional): Callback functions to run during training.
+        """
+        self.dataset_cfgs = []
+        self.val_cfgs = []
+        self.dataset_labels = []
+        self.val_loaders = []
+        self.per_dataset_metrics = {}
+        self._loss_sum_by_dataset = {}
+        self._loss_count_by_dataset = {}
+        self._batch_dataset_idx = None
+        super().__init__(cfg, overrides, _callbacks)
+        if self.args.compile:
+            raise ValueError("Multi-dataset multi-head training does not support compile=True; set compile=False.")
+        self.add_callback("on_train_batch_end", self._accumulate_per_dataset_loss)
+        self.add_callback("on_train_epoch_end", self._log_per_dataset_losses)
+
+    def get_dataset(self) -> dict[str, Any]:
+        """Load one checked dataset per entry of the multi-dataset YAML and merge their metadata.
+
+        Returns:
+            (dict[str, Any]): Merged dataset dictionary with per-dataset `nc`/`names` metadata.
+
+        Raises:
+            TypeError: If `data` is a list instead of a multi-dataset YAML path.
+            SyntaxError: If the YAML does not list one dataset YAML per entry under `train`.
+        """
+        data = self.args.data
+        if isinstance(data, (list, tuple)):
+            raise TypeError(
+                "Multi-dataset joint training expects a single multi-dataset YAML (e.g. data=multi.yaml); "
+                "a data list is treated as sequential fine-tuning by Model.train()."
+            )
+        path = Path(str(data))
+        multi = YAML.load(check_file(path))
+
+        def load(entry, split=""):
+            p = Path(str(entry))
+            p = p if p.is_absolute() else (path.parent / p)
+            if p.suffix not in {".yaml", ".yml"}:
+                raise SyntaxError(f"multi-dataset entries must be dataset YAML files, but got '{entry}'")
+            return check_det_dataset(str(p), split=split)
+
+        train_entries = multi.get("train")
+        if not isinstance(train_entries, (list, tuple)) or not train_entries:
+            raise SyntaxError(
+                f"{path.name} must map 'train' to a non-empty list of dataset YAMLs, but got {train_entries!r}"
+            )
+        val_entries = multi.get("val")
+        val_entries = list(train_entries) if val_entries is None or val_entries == "" else val_entries
+        if not isinstance(val_entries, (list, tuple)):
+            val_entries = [val_entries]
+        if len(val_entries) != len(train_entries):
+            raise SyntaxError(
+                f"{path.name} must list one val YAML per train YAML to pair datasets with heads, "
+                f"but got {len(train_entries)} train and {len(val_entries)} val entries"
+            )
+        self.dataset_cfgs = [load(e) for e in train_entries]
+        self.val_cfgs = [load(e, split=self.args.split) for e in val_entries]
+        self.dataset_labels = _display_names(train_entries)
+
+        if self.args.single_cls:
+            LOGGER.info("Overriding class names with single class.")
+            for cfg in (*self.dataset_cfgs, *self.val_cfgs):
+                cfg["names"] = {0: "item"}
+                cfg["nc"] = 1
+        else:
+            for label, train_cfg, val_cfg in zip(self.dataset_labels, self.dataset_cfgs, self.val_cfgs):
+                if train_cfg["names"] != val_cfg["names"]:
+                    LOGGER.warning(
+                        f"Validation dataset '{label}' class names differ from its training head; "
+                        "metrics use the validation class names but predictions come from the training head."
+                    )
+        return {
+            "train": [cfg["train"] for cfg in self.dataset_cfgs],
+            "val": [cfg[self.args.split] for cfg in self.val_cfgs],
+            "nc": sum(cfg["nc"] for cfg in self.dataset_cfgs),  # flattened total for shared trainer math
+            "dataset_nc": [cfg["nc"] for cfg in self.dataset_cfgs],  # one entry per dataset head
+            "names": _flat_names(self.dataset_labels, [cfg["names"] for cfg in self.dataset_cfgs]),
+            "channels": self.dataset_cfgs[0].get("channels", 3),
+            "path": path.parent,
+        }
+
+    def build_dataset(self, img_path: str | list, mode: str = "train", batch: int | None = None):
+        """Build the mixed training dataset, or a single validation dataset in val mode.
+
+        Args:
+            img_path (str | list): Dataset image path used in val mode; ignored for the mixed train dataset.
+            mode (str): 'train' mode or 'val' mode, users are able to customize different augmentations for each mode.
+            batch (int, optional): Size of batches, this is for 'rect' mode.
+
+        Returns:
+            (Dataset): MultiDatasetConcatDataset in train mode, YOLODataset in val mode.
+        """
+        gs = max(int(unwrap_model(self.model).stride.max() if self.model else 0), 32)
+        if mode == "train":
+            datasets = [
+                build_yolo_dataset(self.args, cfg["train"], batch, cfg, mode=mode, stride=gs, rect=False)
+                for cfg in self.dataset_cfgs
+            ]
+            return MultiDatasetConcatDataset(datasets)
+        cfg = self.val_cfgs[0]
+        return build_yolo_dataset(self.args, cfg[self.args.split], batch, cfg, mode=mode, rect=True, stride=gs)
+
+    def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
+        """Return the mixed training loader, or build and return one validation loader per dataset.
+
+        Args:
+            dataset_path (str): Unused; datasets come from the parsed multi-dataset YAML.
+            batch_size (int): Number of images per batch.
+            rank (int): Process rank for distributed training.
+            mode (str): 'train' for the mixed loader, 'val' for the per-dataset loaders.
+
+        Returns:
+            (DataLoader): The training loader, or the first validation loader (all live in `val_loaders`).
+        """
+        assert mode in {"train", "val"}, f"Mode must be 'train' or 'val', not {mode}."
+        if mode == "train":
+            with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
+                dataset = self.build_dataset(dataset_path, mode, batch_size)
+            sampler = MultiDatasetBatchSampler(
+                dataset.dataset_sizes,
+                batch_size,
+                num_replicas=self.world_size,
+                rank=max(rank, 0),
+                seed=int(self.args.seed) + 1,
+            )
+            loader = build_dataloader(
+                dataset, batch=batch_size, workers=self.args.workers, batch_sampler=sampler, device=self.device
+            )
+            # DataLoader locks sampler/batch_size after init; iteration uses batch_sampler, while these keep the
+            # DDP epoch sync (train_loader.sampler.set_epoch) and downstream batch-size math working.
+            object.__setattr__(loader, "sampler", sampler)
+            object.__setattr__(loader, "batch_size", batch_size)
+            return loader
+        gs = max(int(unwrap_model(self.model).stride.max() if self.model else 0), 32)
+        self.val_loaders = []
+        for cfg in self.val_cfgs:
+            with torch_distributed_zero_first(rank):
+                ds = build_yolo_dataset(
+                    self.args, cfg[self.args.split], batch_size, cfg, mode=mode, rect=True, stride=gs
+                )
+            self.val_loaders.append(
+                build_dataloader(
+                    ds, batch=batch_size, workers=self.args.workers, shuffle=False, rank=rank, device=self.device
+                )
+            )
+        return self.val_loaders[0]
+
+    def get_model(self, cfg: str | dict | None = None, weights: torch.nn.Module | None = None, verbose: bool = True):
+        """Return a multi-head YOLO detection model with one head per dataset.
+
+        Args:
+            cfg (str | dict, optional): Model configuration file path or dictionary.
+            weights (torch.nn.Module, optional): Pretrained model whose weights seed the new model.
+            verbose (bool): Whether to display model information.
+
+        Returns:
+            (MultiHeadDetectionModel): Multi-head detection model.
+        """
+        share = getattr(self.args, "share", "all")
+        if share not in {"all", "backbone"}:
+            raise ValueError(f"share must be 'all' or 'backbone', not {share!r}")
+        model = MultiHeadDetectionModel(
+            cfg or "yolo11n.yaml",
+            ch=self.data["channels"],
+            nc=self.data["dataset_nc"],
+            share=share,
+            verbose=verbose and RANK == -1,
+        )
+        model.names = self.data["names"]
+        model.dataset_names = [dict(c["names"]) for c in self.dataset_cfgs]
+        if weights:
+            model.load(weights)
+        return model
+
+    def set_model_attributes(self):
+        """Attach the flattened class namespace and per-dataset metadata to the model."""
+        self.model.nc = self.data["nc"]
+        self.model.nc_list = list(self.data["dataset_nc"])
+        self.model.names = self.data["names"]
+        self.model.dataset_names = [dict(cfg["names"]) for cfg in self.dataset_cfgs]
+        self.model.args = self.args
+
+    def set_class_weights(self):
+        """Compute per-head class weights from each dataset's labels when cls_pw > 0."""
+        assert 0 <= self.args.cls_pw <= 1.0, "cls_pw must be in the range [0, 1]"
+        if self.args.cls_pw == 0.0:
+            return
+        weights = []
+        for cfg, ds in zip(self.dataset_cfgs, self.train_loader.dataset.datasets):
+            if not len(ds.labels):
+                return
+            counts = np.bincount(
+                np.concatenate([lb["cls"].flatten() for lb in ds.labels]).astype(int), minlength=cfg["nc"]
+            ).astype(np.float32)
+            w = (1.0 / np.where(counts == 0, 1.0, counts)) ** self.args.cls_pw
+            weights.append(torch.from_numpy(w / w.mean()).to(self.device))
+        unwrap_model(self.model).per_head_class_weights = weights
+        LOGGER.info(
+            "Per-dataset class weights: "
+            + ", ".join(f"{label}={w.cpu().numpy().round(3)}" for label, w in zip(self.dataset_labels, weights))
+        )
+
+    def plot_training_labels(self):
+        """Plot label statistics of every dataset into its own subdirectory."""
+        for label, cfg, ds in zip(self.dataset_labels, self.dataset_cfgs, self.train_loader.dataset.datasets):
+            if not len(ds.labels):
+                continue
+            boxes = np.concatenate([lb["bboxes"] for lb in ds.labels], 0)
+            cls = np.concatenate([lb["cls"] for lb in ds.labels], 0)
+            path = self.save_dir / f"labels_{label}"
+            path.mkdir(parents=True, exist_ok=True)
+            plot_labels(boxes, cls.squeeze(), names=cfg["names"], save_dir=path, on_plot=self.on_plot)
+
+    def auto_batch(self):
+        """Raise: AutoBatch cannot mix batches of different sizes across dataset heads."""
+        raise ValueError(
+            "'batch=-1' (AutoBatch) is not supported for multi-dataset training; set an explicit batch size."
+        )
+
+    def preprocess_batch(self, batch):
+        """Record the batch's source dataset before moving tensors to the device.
+
+        Args:
+            batch (dict): Batch dictionary that carries the `dataset_idx` tag in multi-dataset training.
+
+        Returns:
+            (dict): Preprocessed batch.
+        """
+        ds = batch.get("dataset_idx")
+        if ds is not None and ds.numel():
+            self._batch_dataset_idx = int(ds[0])
+        return super().preprocess_batch(batch)
+
+    def _accumulate_per_dataset_loss(self, trainer):
+        """Accumulate each step's loss components under the dataset of the batch."""
+        idx = self._batch_dataset_idx
+        if idx is None or trainer.loss_items is None:
+            return
+        sums = self._loss_sum_by_dataset.setdefault(idx, {})
+        for k, v in trainer.loss_items.items():
+            v = v.detach()
+            sums[k] = v if k not in sums else sums[k] + v
+        self._loss_count_by_dataset[idx] = self._loss_count_by_dataset.get(idx, 0) + 1
+
+    def _log_per_dataset_losses(self, trainer):
+        """Log per-dataset mean training losses at the end of each epoch."""
+        if RANK not in {-1, 0} or not self._loss_sum_by_dataset:
+            return
+        lines = []
+        for i in sorted(self._loss_sum_by_dataset):
+            label = self.dataset_labels[i] if i < len(self.dataset_labels) else f"dataset{i}"
+            n = max(self._loss_count_by_dataset.get(i, 1), 1)
+            losses = "  ".join(f"{k} {float(v) / n:.4g}" for k, v in self._loss_sum_by_dataset[i].items())
+            lines.append(f"  {label}: batches {self._loss_count_by_dataset.get(i, 0)}  {losses}")
+        LOGGER.info("train per-dataset losses:\n" + "\n".join(lines))
+        self._loss_sum_by_dataset, self._loss_count_by_dataset = {}, {}
+
+    def validate(self):
+        """Validate every dataset with its own head and return mean metrics and mean fitness.
+
+        Returns:
+            (tuple): Mean metrics dict across datasets and mean fitness, or (None, None) without validation data.
+        """
+        if not self.val_loaders:
+            return None, None
+        per_dataset, all_metrics = {}, []
+        for i, (label, loader, cfg) in enumerate(zip(self.dataset_labels, self.val_loaders, self.val_cfgs)):
+            self.validator.dataloader = loader
+            self.validator.head_index = i
+            self.validator.dataset_names = dict(cfg["names"])
+            self.validator.save_dir = self.save_dir / f"val_{label}"
+            self.validator.save_dir.mkdir(parents=True, exist_ok=True)
+            saved_data = self.data
+            self.data = cfg  # BaseValidator installs trainer.data for metric names and label paths
+            try:
+                results = self.validator(self)
+            finally:
+                self.data = saved_data
+            if results is None:
+                continue
+            per_dataset[label] = results
+            all_metrics.append(results)
+            LOGGER.info(
+                colorstr("val: ")
+                + f"{label}: "
+                + ", ".join(f"{k} {v:.4g}" for k, v in results.items() if k != "fitness")
+            )
+        if not all_metrics:
+            return None, None
+        mean = {}
+        for k in all_metrics[0]:
+            if k == "fitness":
+                continue
+            vals = [m[k] for m in all_metrics if k in m and m[k] is not None]
+            mean[k] = float(np.mean(vals)) if vals else 0.0
+        fitnesses = [m["fitness"] for m in all_metrics if m.get("fitness") is not None]
+        mean["fitness"] = float(np.mean(fitnesses)) if fitnesses else mean.get("metrics/mAP50-95(B)", 0.0)
+        self.per_dataset_metrics[getattr(self, "_metrics_epoch_key", self.epoch)] = per_dataset
+        self._write_per_dataset_metrics()
+        fitness = mean.pop("fitness")
+        if self.best_fitness is None or self.best_fitness < fitness:
+            self.best_fitness = fitness
+        return mean, fitness
+
+    def _write_per_dataset_metrics(self):
+        """Persist the per-dataset, per-epoch metrics next to the run outputs."""
+        try:
+            (self.save_dir / "metrics.json").write_text(
+                json.dumps(self.per_dataset_metrics, indent=2), encoding="utf-8"
+            )
+        except OSError as e:
+            LOGGER.warning(f"Failed to write metrics.json: {e}")
+
+    def get_validator(self):
+        """Return the validator that scores one dataset at a time with its matching head."""
+        return MultiDatasetDetectionValidator(
+            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+        )
+
+    def final_eval(self):
+        """Validate the best checkpoint on every dataset with its matching head."""
+        best = self.best if self.best.exists() else None
+        with torch_distributed_zero_first(LOCAL_RANK):
+            if RANK in {-1, 0}:
+                ckpt = strip_optimizer(self.last) if self.last.exists() else {}
+                if best:
+                    strip_optimizer(self.best, updates={"train_results": ckpt.get("train_results")})
+        if not best:
+            return
+        LOGGER.info(f"\nValidating {best}...")
+        model, _ = load_checkpoint(best)
+        model = model.to(self.device)
+        model.args = self.args
+        model.names = self.data["names"]
+        model.criterion = None
+        self.model = model
+        self.ema = None
+        self.validator.args.plots = self.args.plots
+        self.validator.args.compile = False
+        self._metrics_epoch_key = "best"  # record the best-checkpoint pass separately from the epoch rows
+        self.metrics, self.fitness = self.validate()
+        del self._metrics_epoch_key
+        self.epoch += 1  # log best metrics at step epochs+1, not overwriting the last epoch row
+        self.run_callbacks("on_fit_epoch_end")
+        self.epoch -= 1
